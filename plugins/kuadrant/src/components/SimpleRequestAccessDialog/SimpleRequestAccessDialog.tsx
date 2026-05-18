@@ -112,6 +112,16 @@ export const SimpleRequestAccessDialog = ({
 
     setCreating(true);
     try {
+      // Get username from identity
+      const identity = await identityApi.getBackstageIdentity();
+      const username = identity.userEntityRef.split('/')[1] || 'unknown';
+
+      // Generate secret name
+      const randomSuffix = Math.random().toString(36).substring(2, 10);
+      const secretName = `${username}-${apiProductName}-secret-${randomSuffix}`
+        .toLowerCase()
+        .replace(/[^a-z0-9-]/g, '-');
+
       const response = await fetchApi.fetch(
         `${backendUrl}/api/kuadrant/requests`,
         {
@@ -125,6 +135,7 @@ export const SimpleRequestAccessDialog = ({
             planTier: selectedTier,
             useCase: useCase.trim() || '',
             userEmail: userEmail || 'unknown',
+            secretName,
           }),
         },
       );
@@ -147,6 +158,7 @@ export const SimpleRequestAccessDialog = ({
             planTier: selectedTier,
             useCase: useCase.trim() || '',
             userEmail: userEmail || 'unknown',
+            secretName: '(generated)',
           }
         });
 

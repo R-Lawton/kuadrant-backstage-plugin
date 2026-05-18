@@ -61,29 +61,59 @@ export const RequestAccessDialog = ({
 
     setCreating(true);
     setCreateError(null);
+
     try {
-      await kuadrantApi.createRequest({
-        apiProductName,
-        namespace,
-        planTier: selectedPlan,
-        useCase: useCase.trim() || '',
-        userEmail,
-      });
+      // 1. Generate API key
+      const apiKeyValue = crypto.randomUUID();
 
-      alertApi.post({
-        message: 'API key requested successfully',
-        severity: 'success',
-        display: 'transient',
-      });
+      // 2. Generate secret name (opaque, no PII)
+      const secretName = `${apiProductName}-${crypto.randomUUID()}-secret`
+        .toLowerCase()
+        .replace(/[^a-z0-9-]/g, '-');
 
-      setSelectedPlan('');
-      setUseCase('');
-      onSuccess();
-    } catch (err) {
-      const errorMessage =
-        err instanceof Error ? err.message : 'unknown error occurred';
+      // 3. Create secret in consumer's namespace (backend determines namespace from auth)
+      await kuadrantApi.createSecret(secretName, apiKeyValue);
+
+      try {
+        // 4. Create APIKey resource (backend creates in consumer's namespace)
+        await kuadrantApi.createRequest({
+          apiProductName,
+          namespace,
+          planTier: selectedPlan,
+          useCase: useCase.trim() || '',
+          userEmail,
+          secretName,
+        });
+
+        // 5. Success - request submitted and pending approval
+        // Consumer can view the API key in My API Keys tab
+        // Key exists but won't work until approved
+        alertApi.post({
+          message: `Request submitted successfully. Pending API owner approval. View your API key in the My API Keys tab.`,
+          severity: 'info',
+          display: 'transient',
+        });
+
+        setSelectedPlan('');
+        setUseCase('');
+        onSuccess();
+
+      } catch (apiKeyError) {
+        // APIKey creation failed - cleanup orphaned secret
+        // Note: backend will delete from user's own namespace
+        try {
+          // Pass any namespace - backend validates it's the user's own namespace
+          await kuadrantApi.deleteSecret('consumer', secretName);
+        } catch (deleteError) {
+          console.warn('Failed to cleanup orphaned secret:', deleteError);
+        }
+        throw apiKeyError;
+      }
+
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'unknown error occurred';
       alertApi.post({
-        message: `Failed to request API key: ${errorMessage}`,
+        message: `Failed to create request: ${errorMessage}`,
         severity: 'error',
         display: 'transient',
       });
