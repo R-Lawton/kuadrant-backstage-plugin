@@ -19,27 +19,53 @@ export type OpenAPISpecConditionReason =
   | 'SpecSizeTooLarge'
   | 'FetchFailed';
 
+/**
+ * APIKey condition types from developer-portal-controller
+ * https://github.com/Kuadrant/developer-portal-controller/blob/main/api/v1alpha1/apikey_types.go
+ */
+export type APIKeyConditionType =
+  | 'Approved'   // API owner approved the request
+  | 'Denied'     // API owner rejected the request
+  | 'Pending'    // Awaiting approval
+  | 'Failed';    // Processing error
+
 export type StatusConditionType =
   | 'OpenAPISpecReady'
+  | APIKeyConditionType
   | string; // Allow other condition types
 
+/**
+ * Kubernetes standard status condition (metav1.Condition)
+ * Matches: https://pkg.go.dev/k8s.io/apimachinery/pkg/apis/meta/v1#Condition
+ */
 export interface StatusCondition {
+  /** Type of condition (e.g., 'Approved', 'Denied', 'Pending', 'Failed') */
   type: StatusConditionType;
+  /** Status of the condition: True, False, or Unknown */
   status: 'True' | 'False' | 'Unknown';
-  reason?: OpenAPISpecConditionReason | string;
-  message?: string;
+  /** ObservedGeneration represents the .metadata.generation that the condition was set based upon */
+  observedGeneration?: number;
+  /** LastTransitionTime is when the condition last changed status */
   lastTransitionTime?: string;
+  /** Reason is a programmatic identifier for the condition's last transition */
+  reason?: OpenAPISpecConditionReason | string;
+  /** Message is a human-readable explanation */
+  message?: string;
 }
 
 export interface APIKeySpec {
   apiProductRef: {
     name: string;
+    namespace: string;
   };
   planTier: PlanTier;
   useCase: string;
   requestedBy: {
     userId: string;
     email: string;
+  };
+  secretRef: {
+    name: string;
   };
 }
 
@@ -85,16 +111,19 @@ export interface APIKeyAuthScheme {
 }
 
 export interface APIKeyStatus {
+  /** @deprecated Use getAPIKeyPhase(conditions) instead. Will be removed after all components migrated. */
   phase?: RequestPhase;
+  /** @deprecated Will be removed in future version. */
   reviewedBy?: string;
+  /** @deprecated Will be removed in future version. */
   reviewedAt?: string;
+  /** @deprecated Use spec.secretRef instead. */
+  secretRef?: { name: string; key: string };
+  /** @deprecated Secret viewing no longer restricted. Will be removed in future version. */
+  canReadSecret?: boolean;
+
   apiHostname?: string;
   limits?: PlanLimits;
-  secretRef?: {
-    name: string;
-    key: string;
-  };
-  canReadSecret?: boolean;
   authScheme?: APIKeyAuthScheme;
   conditions?: StatusCondition[];
 }
@@ -118,7 +147,8 @@ export interface APIKeyRequest {
   namespace: string,
   planTier: PlanTier,
   useCase: string,
-  userEmail: string
+  userEmail: string,
+  secretName: string
 }
 
 export interface APIProductSpec {
