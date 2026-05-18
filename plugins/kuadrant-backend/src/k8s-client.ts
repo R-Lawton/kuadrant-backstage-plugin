@@ -358,5 +358,24 @@ export class KuadrantK8sClient {
       throw new Error(`failed to patch ${plural}/${name} status: ${error.message}`);
     }
   }
+
+  // Namespace operations
+  async getNamespace(name: string): Promise<K8sResource> {
+    try {
+      const response = await this.coreApi.readNamespace(name);
+      return response.body as K8sResource;
+    } catch (error: any) {
+      throw error; // Propagate the error with statusCode for 404 handling
+    }
+  }
+
+  async createNamespace(namespace: K8sResource): Promise<K8sResource> {
+    try {
+      const response = await this.coreApi.createNamespace(namespace as k8s.V1Namespace);
+      return response.body as K8sResource;
+    } catch (error: any) {
+      throw new Error(`failed to create namespace: ${error.message}`);
+    }
+  }
 }
 

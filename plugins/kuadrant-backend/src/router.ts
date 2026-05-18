@@ -45,6 +45,66 @@ function extractNameFromEntityRef(entityRef: string): string {
   return parts[parts.length - 1];
 }
 
+/**
+ * Get consumer's namespace from userEntityRef.
+ * Uses convention: user:default/username -> namespace "username"
+ *
+ * @param userEntityRef - User entity reference (e.g., "user:default/consumer1")
+ * @returns Kubernetes-valid namespace name
+ * @throws Error if username is invalid or cannot be converted to namespace
+ */
+function getConsumerNamespace(userEntityRef: string): string {
+  const username = extractNameFromEntityRef(userEntityRef);
+
+  // Edge case: empty username or just whitespace
+  if (!username || username.trim() === '') {
+    throw new Error('Invalid user identity - username is empty');
+  }
+
+  // Sanitize for Kubernetes DNS-1123 label (lowercase alphanumeric + dashes)
+  const namespace = username.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+
+  // Validate result
+  if (namespace === '' || namespace.startsWith('-') || namespace.endsWith('-')) {
+    throw new Error(`Username "${username}" cannot be converted to valid namespace name`);
+  }
+
+  // Kubernetes namespace max length is 63 characters
+  if (namespace.length > 63) {
+    throw new Error(`Username "${username}" is too long for namespace (max 63 characters)`);
+  }
+
+  return namespace;
+}
+
+/**
+ * Ensure consumer's namespace exists, create if missing.
+ *
+ * @param k8sClient - Kubernetes client
+ * @param namespace - Namespace name
+ */
+async function ensureConsumerNamespace(k8sClient: KuadrantK8sClient, namespace: string): Promise<void> {
+  try {
+    await k8sClient.getNamespace(namespace);
+  } catch (error: any) {
+    if (error.statusCode === 404 || error.response?.statusCode === 404) {
+      // Namespace doesn't exist, create it
+      await k8sClient.createNamespace({
+        apiVersion: 'v1',
+        kind: 'Namespace',
+        metadata: {
+          name: namespace,
+          labels: {
+            'devportal.kuadrant.io/consumer-namespace': 'true',
+          },
+        },
+      });
+    } else {
+      throw error;
+    }
+  }
+}
+
 async function getUserIdentity(req: express.Request, httpAuth: HttpAuthService, userInfo: UserInfoService): Promise<{
   userEntityRef: string;
   groups: string[];
@@ -665,13 +725,126 @@ export async function createRouter({
     }
   });
 
+  // Secret management endpoints
+  router.post('/secrets', async (req, res) => {
+    try {
+      const schema = z.object({
+        name: z.string(),
+        apiKeyValue: z.string(),
+      });
+
+      const parsed = schema.safeParse(req.body);
+      if (!parsed.success) {
+        throw new InputError(parsed.error.toString());
+      }
+
+      // Get authenticated user identity
+      const { userEntityRef } = await getUserIdentity(req, httpAuth, userInfo);
+
+      // Determine consumer's namespace from userEntityRef
+      const consumerNamespace = getConsumerNamespace(userEntityRef);
+
+      const credentials = await httpAuth.credentials(req);
+
+      // Check permission to create secrets in consumer's namespace
+      const resourceRef = `secret:${consumerNamespace}/*`;
+      const decision = await permissions.authorize(
+        [{
+          permission: kuadrantApiKeyCreatePermission,
+          resourceRef,
+        }],
+        { credentials }
+      );
+
+      if (decision[0].result !== AuthorizeResult.ALLOW) {
+        throw new NotAllowedError('not authorized to create secrets');
+      }
+
+      // Ensure consumer's namespace exists
+      await ensureConsumerNamespace(k8sClient, consumerNamespace);
+
+      const { name, apiKeyValue } = parsed.data;
+
+      const secret = {
+        apiVersion: 'v1',
+        kind: 'Secret',
+        metadata: {
+          name,
+          namespace: consumerNamespace,
+        },
+        type: 'Opaque',
+        data: {
+          api_key: Buffer.from(apiKeyValue).toString('base64'),
+        },
+      };
+
+      const created = await k8sClient.createSecret(consumerNamespace, secret);
+      res.status(201).json(created);
+
+    } catch (error) {
+      console.error('error creating secret:', error);
+      if (error instanceof NotAllowedError) {
+        res.status(403).json({ error: error.message });
+      } else if (error instanceof InputError) {
+        res.status(400).json({ error: error.message });
+      } else {
+        const errorMessage = error instanceof Error ? error.message : 'failed to create secret';
+        res.status(500).json({ error: errorMessage });
+      }
+    }
+  });
+
+  router.delete('/secrets/:namespace/:name', async (req, res) => {
+    try {
+      const { namespace, name } = req.params;
+
+      // Get authenticated user identity
+      const { userEntityRef } = await getUserIdentity(req, httpAuth, userInfo);
+
+      // Determine consumer's namespace from userEntityRef
+      const consumerNamespace = getConsumerNamespace(userEntityRef);
+
+      // Only allow deletion from consumer's own namespace
+      if (namespace !== consumerNamespace) {
+        throw new NotAllowedError(`can only delete secrets from your own namespace (${consumerNamespace})`);
+      }
+
+      const credentials = await httpAuth.credentials(req);
+
+      // Check permission
+      const decision = await permissions.authorize(
+        [{
+          permission: kuadrantApiKeyDeleteOwnPermission,
+        }],
+        { credentials }
+      );
+
+      if (decision[0].result !== AuthorizeResult.ALLOW) {
+        throw new NotAllowedError('not authorized to delete this secret');
+      }
+
+      await k8sClient.deleteSecret(namespace, name);
+      res.status(204).send();
+
+    } catch (error) {
+      console.error('error deleting secret:', error);
+      if (error instanceof NotAllowedError) {
+        res.status(403).json({ error: error.message });
+      } else {
+        const errorMessage = error instanceof Error ? error.message : 'failed to delete secret';
+        res.status(500).json({ error: errorMessage });
+      }
+    }
+  });
+
   // apikey crud endpoints
   const requestSchema = z.object({
     apiProductName: z.string(), // name of the APIProduct
-    namespace: z.string(), // namespace where both APIProduct and APIKey live
+    namespace: z.string(), // owner namespace (where APIProduct lives)
     planTier: z.string(),
     useCase: z.string().optional(),
     userEmail: z.string().optional(),
+    secretName: z.string(), // name of secret frontend created
   });
 
   router.post('/requests', async (req, res) => {
@@ -700,9 +873,16 @@ export async function createRouter({
       if (decision[0].result !== AuthorizeResult.ALLOW) {
         throw new NotAllowedError(`not authorised to request access to ${apiProductName}`);
       }
+      // Determine consumer's namespace from userEntityRef
+      const consumerNamespace = getConsumerNamespace(userEntityRef);
+
+      // Ensure consumer's namespace exists
+      await ensureConsumerNamespace(k8sClient, consumerNamespace);
+
       const randomSuffix = randomBytes(4).toString('hex');
-      const userName = extractNameFromEntityRef(userEntityRef);
-      const requestName = `${userName}-${apiProductName}-${randomSuffix}`.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+      // APIKey name: just apiproduct + random suffix (namespace provides user isolation)
+      // Controller will prepend namespace when creating shadow APIKeyRequest
+      const requestName = `${apiProductName}-${randomSuffix}`.toLowerCase().replace(/[^a-z0-9-]/g, '-');
 
       const requestedBy: any = { userId: userEntityRef };
       if (userEmail) {
@@ -714,22 +894,27 @@ export async function createRouter({
         kind: 'APIKey',
         metadata: {
           name: requestName,
-          namespace,
+          namespace: consumerNamespace,
         },
         spec: {
           apiProductRef: {
             name: apiProductName,
+            namespace,
           },
           planTier,
           useCase: useCase || '',
           requestedBy,
+          secretRef: {
+            name: parsed.data.secretName,
+            key: 'api_key',
+          },
         },
       };
 
       const created = await k8sClient.createCustomResource(
         'devportal.kuadrant.io',
         'v1alpha1',
-        namespace,
+        consumerNamespace,
         'apikeys',
         request,
       );
@@ -778,6 +963,8 @@ export async function createRouter({
       const status = req.query.status as string;
       const namespace = req.query.namespace as string;
 
+      // Query APIKeyRequest shadow resources (in owner's namespace)
+      // Controller creates these automatically from consumer's APIKey resources
       let data;
       if (namespace) {
         data = await k8sClient.listCustomResources('devportal.kuadrant.io', 'v1alpha1', 'apikeyrequests', namespace);
@@ -787,24 +974,8 @@ export async function createRouter({
 
       let filteredItems = data.items || [];
 
-      // if user only has read.own permission, filter by api product ownership
-      if (!canReadAll) {
-        const { userEntityRef } = await getUserIdentity(req, httpAuth, userInfo);
-
-        // get all apiproducts owned by this user
-        const apiproducts = await k8sClient.listCustomResources('devportal.kuadrant.io', 'v1alpha1', 'apiproducts');
-        const ownedApiProducts = (apiproducts.items || [])
-          .filter((product: any) => {
-            const owner = product.metadata?.annotations?.['backstage.io/owner'];
-            return owner === userEntityRef;
-          })
-          .map((product: any) => product.metadata.name);
-
-        // filter requests to only those for owned api products
-        filteredItems = filteredItems.filter((req: any) =>
-          ownedApiProducts.includes(req.spec?.apiProductRef?.name)
-        );
-      }
+      // Namespace isolation provides RBAC - owner only sees requests in their namespace
+      // No need to filter by ownership - namespace boundary enforces it
 
       if (status) {
         filteredItems = filteredItems.filter((req: any) => {
@@ -853,18 +1024,29 @@ export async function createRouter({
 
       // extract userId from authenticated credentials, not from query params
       const { userEntityRef } = await getUserIdentity(req, httpAuth, userInfo);
-      const namespace = req.query.namespace as string;
 
-      let data;
-      if (namespace) {
-        data = await k8sClient.listCustomResources('devportal.kuadrant.io', 'v1alpha1', 'apikeys', namespace);
-      } else {
-        data = await k8sClient.listCustomResources('devportal.kuadrant.io', 'v1alpha1', 'apikeys');
-      }
+      // Derive consumer's namespace from userEntityRef
+      // Consumer's APIKeys are stored in their own namespace
+      const consumerNamespace = getConsumerNamespace(userEntityRef);
 
-      const filteredItems = (data.items || []).filter(
-        (req: any) => req.spec?.requestedBy?.userId === userEntityRef
+      // Query APIKeys from consumer's own namespace
+      const data = await k8sClient.listCustomResources(
+        'devportal.kuadrant.io',
+        'v1alpha1',
+        'apikeys',
+        consumerNamespace
       );
+
+      // All APIKeys in this namespace belong to this consumer
+      // If namespace query param is provided, filter to only show APIKeys for that API product
+      const apiProductNamespace = req.query.namespace as string | undefined;
+      let filteredItems = data.items || [];
+
+      if (apiProductNamespace) {
+        filteredItems = filteredItems.filter(
+          (item: any) => item.spec?.apiProductRef?.namespace === apiProductNamespace
+        );
+      }
 
       res.json({ items: filteredItems });
     } catch (error) {
@@ -1484,24 +1666,16 @@ export async function createRouter({
         }
       }
 
-      // check if secret can be read
-      if (apiKey.status?.canReadSecret !== true) {
-        res.status(403).json({
-          error: 'secret has already been read and cannot be retrieved again',
-        });
-        return;
-      }
-
-      // check if secretRef is set
-      if (!apiKey.status?.secretRef?.name || !apiKey.status?.secretRef?.key) {
+      // check if secretRef is set in spec
+      if (!apiKey.spec?.secretRef?.name) {
         res.status(404).json({
-          error: 'secret reference not found in apikey status',
+          error: 'secretRef not found in APIKey spec',
         });
         return;
       }
 
       // get the secret
-      const secretName = apiKey.status.secretRef.name;
+      const secretName = apiKey.spec.secretRef.name;
 
       let secret;
       try {
@@ -1527,19 +1701,6 @@ export async function createRouter({
 
       // decode base64
       const decodedApiKey = Buffer.from(apiKeyValue, 'base64').toString('utf-8');
-
-      // update canReadSecret to false
-      await k8sClient.patchCustomResourceStatus(
-        'devportal.kuadrant.io',
-        'v1alpha1',
-        namespace,
-        'apikeys',
-        name,
-        {
-          ...apiKey.status,
-          canReadSecret: false,
-        },
-      );
 
       res.json({
         apiKey: decodedApiKey,
